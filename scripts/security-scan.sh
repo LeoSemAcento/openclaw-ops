@@ -108,10 +108,11 @@ else:
 
 redact_match() {
   local match="$1"
-  local file="${match%%:*}"
-  local rest="${match#*:}"
-  local line="${rest%%:*}"
-  printf '%s:%s' "$file" "$line"
+  if [[ "$match" =~ ^(.*):([0-9]+): ]]; then
+    printf '%s:%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+  else
+    printf '%s' "${match%%:*}"
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -232,9 +233,17 @@ run_credentials() {
 
   local CRED_ISSUES=0
   local CONFIG_DIR="$HOME/.openclaw"
+  local BACKUP_DIR="$HOME/.openclaw-update-backups"
+  local SYSTEMD_USER_DIR="${OPENCLAW_SECURITY_SCAN_SYSTEMD_USER_DIR:-$HOME/.config/systemd/user}"
+  local SYSTEMD_SYSTEM_DIR="${OPENCLAW_SECURITY_SCAN_SYSTEMD_SYSTEM_DIR:-/etc/systemd/system}"
 
-  if [[ ! -d "$CONFIG_DIR" ]]; then
-    log_warn "No ~/.openclaw directory found — skipping credential scan"
+  local scan_roots=()
+  for root in "$CONFIG_DIR" "$BACKUP_DIR" "$SYSTEMD_USER_DIR" "$SYSTEMD_SYSTEM_DIR"; do
+    [[ -d "$root" ]] && scan_roots+=("$root")
+  done
+
+  if [[ ${#scan_roots[@]} -eq 0 ]]; then
+    log_warn "No OpenClaw config roots found — skipping credential scan"
     return
   fi
 
@@ -263,18 +272,37 @@ run_credentials() {
     'dop_v1_[a-f0-9]{64}'
     'vault\.hashicorp\.com/.*token'
   )
+  local FILE_MATCH_ARGS=(
+    -name '*.json' -o
+    -name '*.jsonl' -o
+    -name '*.yaml' -o
+    -name '*.yml' -o
+    -name '*.toml' -o
+    -name '*.conf' -o
+    -name '*.env' -o
+    -name '*.service' -o
+    -name '*.ini' -o
+    -name '*.log' -o
+    -name '*.bak' -o
+    -name '*.bak.*' -o
+    -name '*.backup'
+  )
 
   local secret_count=0
   for pat in "${SECRET_PATTERNS[@]}"; do
-    while IFS= read -r match; do
-      [[ -z "$match" ]] && continue
-      # Skip false positives
-      if echo "$match" | grep -iqE '(example|template|placeholder|your-|TODO|sample|demo)'; then
-        continue
-      fi
-      log_error "  Secret found: $(redact_match "$match")"
-      ((secret_count++)) || true
-    done < <(grep -rnE "$pat" "$CONFIG_DIR" --include='*.json' --include='*.yaml' --include='*.yml' --include='*.toml' --include='*.conf' --include='*.env' 2>/dev/null || true)
+    while IFS= read -r -d '' cfg_file; do
+      while IFS= read -r match; do
+        [[ -z "$match" ]] && continue
+        # Skip false positives
+        if echo "$match" | grep -iqE '(example|template|placeholder|your-|TODO|sample|demo)'; then
+          continue
+        fi
+        log_error "  Secret found: $(redact_match "$match")"
+        ((secret_count++)) || true
+      done < <(grep -nH -E "$pat" "$cfg_file" 2>/dev/null || true)
+    done < <(
+      find "${scan_roots[@]}" -type f \( "${FILE_MATCH_ARGS[@]}" \) -print0 2>/dev/null || true
+    )
   done
 
   if [[ $secret_count -eq 0 ]]; then
@@ -324,7 +352,9 @@ run_credentials() {
         }
       fi
     fi
-  done < <(find "$CONFIG_DIR" -maxdepth 2 \( -name '*.json' -o -name '*.yaml' -o -name '*.yml' -o -name '*.toml' -o -name '*.conf' -o -name '*.env' \) 2>/dev/null || true)
+  done < <(
+    find "${scan_roots[@]}" -type f \( "${FILE_MATCH_ARGS[@]}" \) 2>/dev/null || true
+  )
 
   if [[ $perm_issues -eq 0 ]]; then
     log_ok "Config file permissions OK"

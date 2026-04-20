@@ -22,6 +22,7 @@ This skill ships executable scripts for automated repair and continuous monitori
 | Script | Purpose |
 |--------|---------|
 | `scripts/heal.sh` | One-shot: fix gateway, auth mode, exec approvals, crons, stuck sessions |
+| `scripts/post-update.sh` | Explicit post-update orchestrator: check-update, heal, workspace reconcile, security scan, final health check, policy-guard sentinel trigger |
 | `scripts/watchdog.sh` | Runs every 5 min: HTTP health check, auto-restart, escalate after 3 failures |
 | `scripts/watchdog-install.sh` | Install watchdog as macOS LaunchAgent (survives reboots) |
 | `scripts/watchdog-uninstall.sh` | Remove the LaunchAgent |
@@ -41,6 +42,9 @@ This skill ships executable scripts for automated repair and continuous monitori
 ```bash
 # Run a one-time heal pass now:
 bash scripts/heal.sh
+
+# Run the explicit post-update hook after `openclaw update`:
+bash scripts/post-update.sh
 
 # Install the always-on watchdog (macOS):
 bash scripts/watchdog-install.sh
@@ -71,6 +75,63 @@ The watchdog follows a 3-tier escalation:
 Every heal run appends a JSONL record to `~/.openclaw/logs/heal-incidents.jsonl` so recurring issues become visible over time.
 
 When suggesting scripts to users, always show the correct path relative to wherever this skill is installed (e.g., `~/.openclaw/skills/openclaw-ops/scripts/`).
+
+#
+## Update-safe SOP (baseline → backup → update → restart → verify → rollback)
+
+Derived from: https://x.com/i/status/2022534710103044350
+
+**Baseline (before + after):**
+- `openclaw status --all`
+- `openclaw health`
+- `openclaw channels status --probe`
+- (if available) `openclaw security audit --deep`
+
+**Backup OpenClaw state (~/.openclaw):**
+```bash
+ts=$(date -u +%Y%m%d-%H%M%S)
+tar -czf "$HOME/openclaw-state-$ts.tgz" -C "$HOME" .openclaw
+chmod 600 "$HOME/openclaw-state-$ts.tgz"
+ls -lh "$HOME/openclaw-state-$ts.tgz"
+```
+
+**Preferred update command:**
+```bash
+curl -fsSL https://openclaw.ai/install.sh | bash -s -- --install-method git --no-onboard
+```
+
+**Restart gateway (systemd user):**
+```bash
+systemctl --user restart openclaw-gateway.service
+systemctl --user status openclaw-gateway.service --no-pager
+```
+
+**Rollback (restore backup tarball):**
+```bash
+rm -rf ~/.openclaw
+tar -xzf ~/openclaw-state-<timestamp>.tgz -C ~
+systemctl --user restart openclaw-gateway.service
+```
+
+## Post-update hook
+
+Use `scripts/post-update.sh` immediately after `openclaw update` or from a wrapper that wants the canonical post-update sequence.
+
+The script is idempotent: when the current OpenClaw version matches the stored watchdog state and no version change is pending, it exits before running the heavy sequence.
+
+When it does run, it executes:
+
+1. `check-update.sh --fix`
+2. `heal.sh`
+3. the workspace reconcile script if present
+4. `security-scan.sh`
+5. `openclaw health --json`
+
+On the VPS, the workspace reconcile stage refreshes model policy, auth/profile state, voice defaults, and the gateway service through `openclaw_post_update_reconcile.py` (or the equivalent systemd oneshot wrapper). If the script lives somewhere else, set `OPENCLAW_POST_UPDATE_RECONCILE_SCRIPT` (and `OPENCLAW_POST_UPDATE_RECONCILE_INTERPRETER` if needed).
+
+It then best-effort touches `~/.openclaw/state/policy-guard.trigger` after creating parent directories if needed. The VPS can wire `openclaw-policy-guard.path` to that sentinel so updates explicitly nudge the policy guard without modifying the units here.
+
+If another wrapper or automation layer launches the hook, set `OPENCLAW_SKIP_WRAPPER_BACKUP=1` so nested `openclaw` calls do not trigger backup loops.
 
 ## Session Monitoring
 
@@ -565,3 +626,46 @@ Scans `~/.openclaw/` for API key patterns and checks file permissions (credentia
 
 - Note if gateway restart needed (auth refreshed, major session changes, allowlist edits)
 - Summarize in three buckets: **broken**, **fixed**, **needs manual action**
+
+---
+
+## Daily Backup Sync
+
+Backup diário automático de configurações para GitHub.
+
+### Cron Configuration
+```
+0 6 * * * root /usr/bin/python3 /root/.openclaw/backup/daily_backup_github.py >> /var/log/openclaw-backup.log 2>&1
+```
+
+### Scripts
+- `/root/.openclaw/backup/daily_backup_github.py` - Script principal
+- `/root/.openclaw/backup/timestamps/` - Repositório git local
+
+### GitHub Repository
+`https://github.com/LeoSemAcento/backup-timestamps-oc`
+
+### Usage
+```bash
+# Run backup manually
+python3 /root/.openclaw/backup/daily_backup_github.py
+
+# Dry run (no push)
+python3 /root/.openclaw/backup/daily_backup_github.py --dry
+
+# Force backup
+python3 /root/.openclaw/backup/daily_backup_github.py --force
+```
+
+### Files Monitored
+| File | Path |
+|------|------|
+| openclaw.json | `/root/.openclaw/openclaw.json` |
+| models.json | `/root/.openclaw/agents/rayssa/agent/models.json` |
+| SOUL.md | `/root/.openclaw/workspace/workspaces/rayssa/SOUL.md` |
+| post_update_reconcile.py | `/root/.openclaw/workspace/scripts/` |
+| Systemd overrides | `/etc/systemd/system/openclaw-whatsapp.service.d/` |
+
+### Logs
+- `/var/log/openclaw-backup.log`
+- Snapshots: `/root/.openclaw/backup/timestamps/snapshots/`

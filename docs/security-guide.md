@@ -117,6 +117,31 @@ openclaw config set gateway.auth.mode trusted-proxy
 # Requires an authenticated reverse proxy with TLS in front of the gateway
 ```
 
+### 2b. Exec Approval Layer 2 (v2026.2.24+)
+
+If agents still ask for exec approval after allowlists are correct, check the
+second policy layer as well:
+
+```json
+{
+  "defaults": {
+    "security": "full",
+    "ask": "off",
+    "askFallback": "full"
+  }
+}
+```
+
+And verify the runtime config:
+
+```bash
+openclaw config set tools.exec.security full
+openclaw config set tools.exec.strictInlineEval false
+openclaw gateway restart
+```
+
+See the troubleshooting guide for the full failure mode and diagnostics.
+
 ### 3. Tailscale Authentication
 
 When `gateway.auth.allowTailscale` is enabled, OpenClaw verifies identity headers (`tailscale-user-login`) by resolving the client IP through the local Tailscale daemon:

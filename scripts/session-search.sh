@@ -171,7 +171,7 @@ output_json = sys.argv[4] == "1"
 
 
 def find_agent(path):
-    parts = path.split(os.sep)
+    parts = path.replace("\\", "/").split("/")
     if "agents" in parts:
         idx = parts.index("agents")
         if idx + 1 < len(parts):

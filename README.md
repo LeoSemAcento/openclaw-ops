@@ -14,6 +14,7 @@ Tested against OpenClaw `2026.4.2`.
 | Script | Purpose |
 |--------|---------|
 | `scripts/heal.sh` | One-shot auto-fix for the most common gateway issues |
+| `scripts/post-update.sh` | Explicit post-update orchestrator: check-update, heal, workspace reconcile, security scan, final health check, policy-guard sentinel trigger |
 | `scripts/watchdog.sh` | Runs every 5 min, restarts gateway if down, escalates after 3 failures |
 | `scripts/watchdog-install.sh` | Installs the watchdog as a macOS LaunchAgent |
 | `scripts/watchdog-uninstall.sh` | Removes the LaunchAgent |
@@ -60,20 +61,27 @@ openclaw --version
 # 1. One-time heal pass
 bash scripts/heal.sh
 
-# 2. Check if an update broke your config
+# 2. After every OpenClaw update, run the explicit post-update hook
+bash scripts/post-update.sh
+
+#    The hook also runs the VPS workspace reconcile script when present and
+#    touches ~/.openclaw/state/policy-guard.trigger so a VPS can react through
+#    openclaw-policy-guard.path after the update.
+
+# 3. If you only want the update triage report:
 bash scripts/check-update.sh        # report only
 bash scripts/check-update.sh --fix  # report + auto-fix
 
-# 3. Install always-on watchdog (macOS)
+# 4. Install always-on watchdog (macOS)
 bash scripts/watchdog-install.sh
 
-# 4. View watchdog log
+# 5. View watchdog log
 tail -f ~/.openclaw/logs/watchdog.log
 
-# 5. View incident history
+# 6. View incident history
 cat ~/.openclaw/logs/heal-incidents.jsonl
 
-# 6. Run health checks — targets file is auto-generated on first run
+# 7. Run health checks — targets file is auto-generated on first run
 bash scripts/health-check.sh --verbose
 ```
 
@@ -130,6 +138,11 @@ journalctl --user -u openclaw-gateway -f
 - `health-check.sh` can report a process uptime failure immediately after `openclaw gateway restart` if the target has a minimum uptime threshold (e.g. 300s). That is expected — lower the threshold during smoke tests, then restore it.
 - `security-scan.sh` reports file paths and line numbers for suspected secrets, but redacts the secret values themselves.
 - `check-update.sh` is intended for real post-upgrade triage. It is normal to report a version change the first time it runs after an upgrade.
+- `post-update.sh` is the explicit post-update orchestrator. It skips the heavy sequence when the current version matches the stored state and otherwise runs `check-update.sh --fix`, `heal.sh`, the workspace reconcile script if present, `security-scan.sh`, and a final `openclaw health --json`.
+- On the VPS, the workspace reconcile stage refreshes model policy, auth/profile state, voice defaults, and the gateway service through `openclaw_post_update_reconcile.py` (or the equivalent systemd oneshot wrapper).
+- After the health check it best-effort touches `~/.openclaw/state/policy-guard.trigger` (creating parent dirs if needed). The VPS can wire `openclaw-policy-guard.path` to that sentinel after updates.
+- Set `OPENCLAW_POST_UPDATE_RECONCILE_SCRIPT` (and optionally `OPENCLAW_POST_UPDATE_RECONCILE_INTERPRETER`) if the reconcile script lives somewhere other than the default workspace path.
+- If another wrapper or automation layer launches the post-update hook, set `OPENCLAW_SKIP_WRAPPER_BACKUP=1` for nested `openclaw` calls so internal subcommands do not trigger backup loops.
 - The `startup model warmup failed for claude-cli/...` warning in `gateway.err.log` is non-fatal and expected when using the Claude CLI subprocess backend.
 
 ## Running tests

@@ -5,7 +5,7 @@ LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$LIB_DIR/lib.sh"
 source "$LIB_DIR/incident-manager.sh"
 
-require_tools python3 rg xargs || exit 1
+require_tools python3 xargs || exit 1
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 AGENTS_DIR="${OPENCLAW_AGENTS_DIR:-$HOME/.openclaw/agents}"
@@ -69,22 +69,13 @@ PY
 
 analyze_file() {
   local file="$1"
-  local file_mtime now_epoch prefilter tail_file
-
-  file_mtime="$(file_mtime "$file")"
-  file_mtime="${file_mtime:-0}"
+  local now_epoch
   now_epoch="$(epoch_now)"
-  prefilter=0
-  tail_file="$(mktemp)"
-  trap 'rm -f "$tail_file"' RETURN
+  local file_mtime_epoch
+  file_mtime_epoch="$(file_mtime "$file" || true)"
+  file_mtime_epoch="${file_mtime_epoch:-0}"
 
-  tail -n 200 "$file" >"$tail_file" 2>/dev/null || true
-
-  if rg -qi '401|403|unauthorized|forbidden|token.{0,20}expired|permission denied|error:|failed|traceback' "$tail_file"; then
-    prefilter=1
-  fi
-
-  python3 - "$file" "$tail_file" "$file_mtime" "$now_epoch" "$prefilter" <<'PY'
+  python3 - "$file" "$now_epoch" "$file_mtime_epoch" <<'PY'
 import json
 import os
 import re
@@ -92,10 +83,8 @@ import sys
 from datetime import datetime, timezone
 
 path = sys.argv[1]
-tail_path = sys.argv[2]
-file_mtime = int(float(sys.argv[3] or 0))
-now_epoch = int(float(sys.argv[4] or 0))
-prefilter = sys.argv[5] == "1"
+now_epoch = int(float(sys.argv[2] or 0))
+file_mtime_epoch = int(float(sys.argv[3] or 0))
 
 
 def parse_epoch(value):
@@ -121,39 +110,41 @@ def emit(agent, anomaly_type, discriminator, severity, title, evidence):
 
 
 def find_agent(file_path):
-    parts = file_path.split(os.sep)
+    parts = file_path.replace("\\", "/").split("/")
     if "agents" in parts:
-      idx = parts.index("agents")
-      if idx + 1 < len(parts):
-          return parts[idx + 1]
+        idx = parts.index("agents")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
     return "unknown"
 
 
 agent = find_agent(path)
 header = {}
 records = []
-with open(path, "r", encoding="utf-8", errors="replace") as handle:
-    first_line = handle.readline().strip()
-    if first_line:
-        try:
-            header = json.loads(first_line)
-        except Exception:
-            header = {}
+try:
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        first_line = handle.readline().strip()
+        if first_line:
+            try:
+                header = json.loads(first_line)
+            except Exception:
+                header = {}
 
-with open(tail_path, "r", encoding="utf-8", errors="replace") as handle:
-    for raw_line in handle:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            records.append(json.loads(line))
-        except Exception:
-            continue
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+except Exception:
+    raise SystemExit(0)
 
 session_id = header.get("id") or os.path.basename(path)
 header_timestamp = parse_epoch(header.get("timestamp"))
-last_activity = 0  # only set from tail records, not header (avoids false stuck-run on long sessions)
-last_activity_from_tail = False
+last_activity = 0
 meaningful_assistant_count = 0
 error_like_count = 0
 auth_matches = []
@@ -164,6 +155,7 @@ current_streak = 0
 
 auth_pattern = re.compile(r"401|403|unauthorized|forbidden|token.{0,20}expired", re.IGNORECASE)
 error_pattern = re.compile(r"error:|failed|traceback|permission denied|cannot proceed|unable to|i apologize", re.IGNORECASE)
+stale_session_window = 86400
 
 for record in records:
     if record.get("type") == "message":
@@ -172,7 +164,6 @@ for record in records:
         timestamp = parse_epoch(record.get("timestamp") or message.get("timestamp"))
         if timestamp:
             last_activity = max(last_activity, timestamp)
-            last_activity_from_tail = True
         content = message.get("content") or []
 
         if role == "assistant":
@@ -190,7 +181,7 @@ for record in records:
                 joined = "\n".join(text_chunks)
                 if error_pattern.search(joined):
                     error_like_count += 1
-                if prefilter and auth_pattern.search(joined):
+                if auth_pattern.search(joined):
                     auth_matches.append(joined[:240])
 
         elif role == "toolResult":
@@ -212,7 +203,7 @@ for record in records:
 
             if joined and (is_error or error_pattern.search(joined)):
                 error_like_count += 1
-            if prefilter and auth_pattern.search(joined):
+            if auth_pattern.search(joined):
                 auth_matches.append(joined[:240])
 
 retry_tool = None
@@ -232,7 +223,7 @@ if retry_tool and retry_count >= 5:
         {"agent": agent, "tool": retry_tool, "count": retry_count, "session_id": session_id, "session_path": path},
     )
 
-effective_last = last_activity if last_activity_from_tail else header_timestamp
+effective_last = last_activity or header_timestamp
 if header_timestamp and now_epoch - header_timestamp > 600 and effective_last and now_epoch - effective_last > 1800 and meaningful_assistant_count < 2:
     emit(
         agent,
@@ -243,14 +234,22 @@ if header_timestamp and now_epoch - header_timestamp > 600 and effective_last an
         {"agent": agent, "meaningful_assistant_messages": meaningful_assistant_count, "session_id": session_id, "session_path": path},
     )
 
-if last_activity_from_tail and last_activity and now_epoch - last_activity > 1800 and file_mtime >= now_epoch - 600:
+if file_mtime_epoch and now_epoch - file_mtime_epoch <= stale_session_window and last_activity and now_epoch - last_activity > 1800 and meaningful_assistant_count >= 1:
     emit(
         agent,
         "stuck-run",
         "_",
         "critical",
         f"Stuck run: {agent} session stopped progressing",
-        {"agent": agent, "last_activity_epoch": last_activity, "file_mtime": file_mtime, "session_id": session_id, "session_path": path},
+        {
+            "agent": agent,
+            "file_mtime_epoch": file_mtime_epoch,
+            "file_mtime_age_seconds": now_epoch - file_mtime_epoch,
+            "last_activity_epoch": last_activity,
+            "last_activity_age_seconds": now_epoch - last_activity,
+            "session_id": session_id,
+            "session_path": path,
+        },
     )
 
 if auth_matches:
@@ -273,9 +272,6 @@ if error_like_count >= 4:
         {"agent": agent, "error_count": error_like_count, "session_id": session_id, "session_path": path},
     )
 PY
-
-  rm -f "$tail_file"
-  trap - RETURN
 }
 
 if [[ "${1:-}" == "--analyze-file" ]]; then

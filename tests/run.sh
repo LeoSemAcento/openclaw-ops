@@ -20,22 +20,69 @@ assert_not_contains() {
   [[ "$haystack" != *"$needle"* ]] || fail "expected output to not contain: $needle"
 }
 
+assert_line_order() {
+  local haystack="$1"
+  shift
+  local previous_line=0
+
+  for needle in "$@"; do
+    local line
+    line="$(printf '%s\n' "$haystack" | grep -nF -- "$needle" | head -n1 | cut -d: -f1 || true)"
+    [[ -n "$line" ]] || fail "expected output to contain: $needle"
+    if (( line < previous_line )); then
+      fail "expected marker order to be non-decreasing: $needle"
+    fi
+    previous_line="$line"
+  done
+}
+
 assert_eq() {
   local actual="$1"
   local expected="$2"
   [[ "$actual" == "$expected" ]] || fail "expected [$expected], got [$actual]"
 }
 
+resolve_python_interpreter() {
+  local candidate
+  local probe
+
+  for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      probe="$("$candidate" -c 'import sys; print(sys.version_info[0])' 2>/dev/null || true)"
+      if [[ "$probe" == "3" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done
+
+  fail "No working Python interpreter found"
+}
+
+PYTHON_BIN="$(resolve_python_interpreter)"
+
 setup_fake_env() {
   TEST_ROOT="$(mktemp -d)"
   export TEST_ROOT
-  export HOME="$TEST_ROOT/home"
+  TEST_HOME="$TEST_ROOT/home"
+  if command -v cygpath >/dev/null 2>&1; then
+    TEST_HOME="$(cygpath -m "$TEST_HOME")"
+  fi
+  export HOME="$TEST_HOME"
+  export USERPROFILE="$TEST_HOME"
   export PATH="$TEST_ROOT/bin:$PATH"
   mkdir -p "$HOME/.openclaw/logs" "$HOME/.openclaw" "$TEST_ROOT/bin"
+  mkdir -p "$HOME/.config/systemd/user" "$TEST_ROOT/etc/systemd/system"
+  export OPENCLAW_SECURITY_SCAN_SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+  export OPENCLAW_SECURITY_SCAN_SYSTEMD_SYSTEM_DIR="$TEST_ROOT/etc/systemd/system"
 
   cat >"$TEST_ROOT/bin/openclaw" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ -n "${OPENCLAW_CALL_LOG:-}" ]]; then
+  printf 'openclaw|skip=%s|%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" "$*" >>"$OPENCLAW_CALL_LOG"
+fi
 
 case "${1:-}" in
   --version|-V)
@@ -43,6 +90,9 @@ case "${1:-}" in
     ;;
   status)
     printf 'OpenClaw %s\n' "${OPENCLAW_STATUS_VERSION:-v2026.2.12}"
+    ;;
+  health)
+    printf '{"healthy":true}\n'
     ;;
   config)
     if [[ "${2:-}" == "get" ]]; then
@@ -150,6 +200,68 @@ install_fixture() {
   cp "$ROOT_DIR/tests/fixtures/$fixture" "$HOME/.openclaw/agents/$agent/sessions/$target_name"
 }
 
+set_file_mtime() {
+  local file="$1"
+  local epoch="$2"
+  "$PYTHON_BIN" - "$file" "$epoch" <<'PY'
+import os
+import sys
+
+path = sys.argv[1]
+epoch = int(float(sys.argv[2]))
+os.utime(path, (epoch, epoch))
+PY
+}
+
+setup_post_update_stub_dir() {
+  POST_UPDATE_STUB_DIR="$TEST_ROOT/post-update-stubs"
+  mkdir -p "$POST_UPDATE_STUB_DIR"
+  cp "$ROOT_DIR/scripts/lib.sh" "$POST_UPDATE_STUB_DIR/lib.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/check-update.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'check-update|skip=%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" >>"${POST_UPDATE_STUB_LOG:?}"
+openclaw --version >/dev/null
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/check-update.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/heal.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'heal|skip=%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" >>"${POST_UPDATE_STUB_LOG:?}"
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/heal.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/security-scan.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'security-scan|skip=%s\n' "${OPENCLAW_SKIP_WRAPPER_BACKUP:-0}" >>"${POST_UPDATE_STUB_LOG:?}"
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/security-scan.sh"
+
+  cat >"$POST_UPDATE_STUB_DIR/openclaw_post_update_reconcile.py" <<'EOF'
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+log = Path(os.environ["POST_UPDATE_STUB_LOG"])
+with log.open("a", encoding="utf-8") as handle:
+    handle.write(f"reconcile|skip={os.environ.get('OPENCLAW_SKIP_WRAPPER_BACKUP', '0')}\n")
+
+subprocess.run(
+    ["openclaw", "gateway", "install", "--force", "--port", "18789"],
+    check=True,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+EOF
+  chmod +x "$POST_UPDATE_STUB_DIR/openclaw_post_update_reconcile.py"
+}
+
 teardown_fake_env() {
   rm -rf "$TEST_ROOT"
 }
@@ -191,17 +303,107 @@ test_heal_incident_logging_no_longer_embeds_shell_generated_python() {
   grep -q "read_lines(sys.argv\\[5\\])" "$heal" || fail "heal incident logging should read manual items from a file"
 }
 
-test_security_scan_respects_maxdepth_for_permission_checks() {
+test_security_scan_detects_nested_files_and_permissions() {
   setup_fake_env
   trap teardown_fake_env RETURN
 
-  mkdir -p "$HOME/.openclaw/a/b"
-  printf 'SAFE=1\n' >"$HOME/.openclaw/a/b/too-deep.env"
-  chmod 777 "$HOME/.openclaw/a/b/too-deep.env"
+  mkdir -p "$HOME/.openclaw/nested/a/b"
+  local global_systemd_dir="$HOME/.openclaw-systemd-global"
+  mkdir -p "$global_systemd_dir/nested/system"
+
+  cat >"$HOME/.openclaw/nested/a/b/deep-secret.jsonl" <<'EOF'
+{"token":"sk-1234567890abcdefghijklmn"}
+EOF
+
+  cat >"$HOME/.openclaw/nested/a/b/deep-worker.service" <<'EOF'
+[Unit]
+Description=Deep worker
+[Service]
+Environment=OPENCLAW_GATEWAY_TOKEN=sk-1234567890abcdefghijklmn
+EOF
+
+  cat >"$global_systemd_dir/nested/system/global-worker.service" <<'EOF'
+[Unit]
+Description=Global worker
+[Service]
+Environment=OPENCLAW_GATEWAY_TOKEN=sk-1234567890abcdefghijklmn
+EOF
+
+  chmod 777 "$HOME/.openclaw/nested/a/b/deep-secret.jsonl"
+  chmod 777 "$HOME/.openclaw/nested/a/b/deep-worker.service"
+  chmod 777 "$global_systemd_dir/nested/system/global-worker.service"
+
+  export OPENCLAW_SECURITY_SCAN_SYSTEMD_SYSTEM_DIR="$global_systemd_dir"
 
   local output
   output="$(bash "$ROOT_DIR/scripts/security-scan.sh" 2>&1)"
-  assert_not_contains "$output" "too-deep.env"
+  assert_contains "$output" "deep-secret.jsonl"
+  assert_contains "$output" "deep-worker.service"
+  assert_contains "$output" "global-worker.service"
+  assert_contains "$output" "has permissions"
+}
+
+test_post_update_skips_when_version_matches_state() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  setup_post_update_stub_dir
+
+  export OPENCLAW_CALL_LOG="$HOME/.openclaw/logs/openclaw-calls.log"
+  export POST_UPDATE_STUB_LOG="$HOME/.openclaw/logs/post-update-stub.log"
+  export OPENCLAW_POST_UPDATE_SCRIPTS_DIR="$POST_UPDATE_STUB_DIR"
+  export OPENCLAW_POST_UPDATE_STATE_FILE="$HOME/.openclaw/watchdog-state.json"
+  export OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER="$HOME/.openclaw/state/policy-guard.trigger"
+
+  mkdir -p "$(dirname "$OPENCLAW_POST_UPDATE_STATE_FILE")"
+  cat >"$OPENCLAW_POST_UPDATE_STATE_FILE" <<'EOF'
+{"current_version":"v2026.2.12","version_change_pending":false}
+EOF
+
+  local output
+  output="$(bash "$ROOT_DIR/scripts/post-update.sh" 2>&1)"
+  assert_contains "$output" "Version unchanged (v2026.2.12) — skipping post-update sequence"
+  [[ ! -f "$OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER" ]] || fail "policy guard trigger should not be touched when skipping"
+  [[ ! -f "$POST_UPDATE_STUB_LOG" ]] || fail "stub scripts should not run when version is unchanged"
+}
+
+test_post_update_runs_sequence_and_touches_policy_guard_trigger() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  setup_post_update_stub_dir
+
+  export OPENCLAW_CALL_LOG="$HOME/.openclaw/logs/openclaw-calls.log"
+  export POST_UPDATE_STUB_LOG="$HOME/.openclaw/logs/post-update-stub.log"
+  export OPENCLAW_POST_UPDATE_SCRIPTS_DIR="$POST_UPDATE_STUB_DIR"
+  export OPENCLAW_POST_UPDATE_STATE_FILE="$HOME/.openclaw/watchdog-state.json"
+  export OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER="$HOME/.openclaw/state/deep/nested/policy-guard.trigger"
+  export OPENCLAW_POST_UPDATE_RECONCILE_SCRIPT="$POST_UPDATE_STUB_DIR/openclaw_post_update_reconcile.py"
+
+  mkdir -p "$(dirname "$OPENCLAW_POST_UPDATE_STATE_FILE")"
+  cat >"$OPENCLAW_POST_UPDATE_STATE_FILE" <<'EOF'
+{"current_version":"v2026.2.11","version_change_pending":true}
+EOF
+
+  bash "$ROOT_DIR/scripts/post-update.sh" >/dev/null
+
+  local stub_log
+  stub_log="$(cat "$POST_UPDATE_STUB_LOG")"
+  assert_line_order "$stub_log" \
+    "check-update|skip=1" \
+    "heal|skip=1" \
+    "reconcile|skip=1" \
+    "security-scan|skip=1"
+
+  local call_log
+  call_log="$(cat "$OPENCLAW_CALL_LOG")"
+  assert_line_order "$call_log" \
+    "openclaw|skip=1|--version" \
+    "openclaw|skip=1|gateway install --force --port 18789" \
+    "openclaw|skip=1|health --json"
+
+  [[ -f "$OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER" ]] || fail "policy guard trigger was not created"
+  [[ -d "$(dirname "$OPENCLAW_POST_UPDATE_POLICY_GUARD_TRIGGER")" ]] || fail "policy guard trigger parent directory was not created"
 }
 
 test_get_openclaw_version_normalizes_missing_v_prefix() {
@@ -354,6 +556,64 @@ test_session_monitor_detects_stuck_runs() {
   assert_contains "$latest_json" "\"severity\": \"critical\""
 }
 
+test_session_monitor_ignores_stale_stuck_runs() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  install_fixture "atlas" "session-stuck.jsonl"
+
+  local session_file="$HOME/.openclaw/agents/atlas/sessions/session-stuck.jsonl"
+  local stale_epoch
+  stale_epoch="$("$PYTHON_BIN" - <<'PY'
+from time import time
+print(int(time()) - 172800)
+PY
+)"
+  set_file_mtime "$session_file" "$stale_epoch"
+
+  bash "$ROOT_DIR/scripts/session-monitor.sh" --no-alert >/dev/null
+
+  local latest_json
+  latest_json="$(cat "$HOME/.openclaw/session-monitor/latest.json")"
+  assert_not_contains "$latest_json" "\"dedupeKey\": \"agent:atlas:stuck-run:_\""
+}
+
+test_session_monitor_detects_auth_errors_and_error_clusters_in_long_sessions() {
+  setup_fake_env
+  trap teardown_fake_env RETURN
+
+  local session_dir="$HOME/.openclaw/agents/orion/sessions"
+  local session_file="$session_dir/session-long.jsonl"
+  local now_ts
+  now_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  mkdir -p "$session_dir"
+
+  cat >"$session_file" <<EOF
+{"type":"session","version":3,"id":"sess-long","timestamp":"$now_ts","cwd":"/tmp/long-session"}
+{"type":"message","id":"l1","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-1","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l2","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-1","toolName":"exec","content":[{"type":"text","text":"401 unauthorized"}],"isError":true,"details":{"status":"failed"}}}
+{"type":"message","id":"l3","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-2","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l4","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-2","toolName":"exec","content":[{"type":"text","text":"error: permission denied"}],"isError":true,"details":{"status":"failed"}}}
+{"type":"message","id":"l5","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-3","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l6","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-3","toolName":"exec","content":[{"type":"text","text":"error: permission denied"}],"isError":true,"details":{"status":"failed"}}}
+{"type":"message","id":"l7","timestamp":"$now_ts","message":{"role":"assistant","content":[{"type":"toolCall","id":"tc-long-4","name":"exec","arguments":{"cmd":"openclaw gateway restart"}}]}}
+{"type":"message","id":"l8","timestamp":"$now_ts","message":{"role":"toolResult","toolCallId":"tc-long-4","toolName":"exec","content":[{"type":"text","text":"error: permission denied"}],"isError":true,"details":{"status":"failed"}}}
+EOF
+
+  for i in $(seq 1 220); do
+    printf '{"type":"message","id":"b%03d","timestamp":"%s","message":{"role":"assistant","content":[{"type":"text","text":"Benign progress update %d"}]}}\n' "$i" "$now_ts" "$i" >>"$session_file"
+  done
+
+  bash "$ROOT_DIR/scripts/session-monitor.sh" --no-alert >/dev/null
+
+  local latest_json
+  latest_json="$(cat "$HOME/.openclaw/session-monitor/latest.json")"
+  assert_contains "$latest_json" "\"dedupeKey\": \"agent:orion:auth-error:_\""
+  assert_contains "$latest_json" "\"dedupeKey\": \"agent:orion:error-cluster:_\""
+  assert_not_contains "$latest_json" "\"dedupeKey\": \"agent:orion:retry-loop:exec\""
+}
+
 test_watchdog_throttles_session_monitor_invocation() {
   setup_fake_env
   trap teardown_fake_env RETURN
@@ -368,6 +628,7 @@ EOF
   export CURL_HTTP_STATUS=200
   export SESSION_MONITOR_STUB_LOG="$HOME/.openclaw/logs/session-monitor-stub.log"
   export OPENCLAW_SESSION_MONITOR_SCRIPT="$ROOT_DIR/tests/.session-monitor-stub.sh"
+  mkdir -p "$(dirname "$SESSION_MONITOR_STUB_LOG")"
 
   bash "$ROOT_DIR/scripts/watchdog.sh" >/dev/null
   bash "$ROOT_DIR/scripts/watchdog.sh" >/dev/null
@@ -445,7 +706,7 @@ run_test() {
 run_test test_version_change_survives_watchdog_for_check_update
 run_test test_lib_removes_generic_eval_exec_helpers
 run_test test_heal_incident_logging_no_longer_embeds_shell_generated_python
-run_test test_security_scan_respects_maxdepth_for_permission_checks
+run_test test_security_scan_detects_nested_files_and_permissions
 run_test test_get_openclaw_version_normalizes_missing_v_prefix
 run_test test_health_check_passes_for_valid_targets
 run_test test_health_check_falls_back_to_etime_on_macos
@@ -454,6 +715,8 @@ run_test test_lib_time_and_sanitization_helpers
 run_test test_incident_lifecycle_and_dedup
 run_test test_session_monitor_detects_retry_loops_and_writes_latest_json
 run_test test_session_monitor_detects_stuck_runs
+run_test test_session_monitor_ignores_stale_stuck_runs
+run_test test_session_monitor_detects_auth_errors_and_error_clusters_in_long_sessions
 run_test test_watchdog_throttles_session_monitor_invocation
 run_test test_session_search_sanitizes_and_handles_corruption
 run_test test_session_resume_uses_compaction_and_detects_failure

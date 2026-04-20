@@ -25,11 +25,52 @@ log_ok()     { echo -e "${GRN}[✓]${RST} $1"; }
 log_warn()   { echo -e "${YLW}[!]${RST} $1"; }
 log_error()  { echo -e "${RED}[✗]${RST} $1"; }
 
+# ── Python launcher resolution ───────────────────────────────────────────────
+# Git Bash on Windows often exposes a non-executable python3 shim via WindowsApps.
+# Resolve a real interpreter once and reuse it everywhere scripts source lib.sh.
+OPENCLAW_PYTHON3_AVAILABLE=0
+OPENCLAW_PYTHON3_CMD=()
+
+_python3_path="$(type -P python3 2>/dev/null || true)"
+if [[ -n "$_python3_path" ]] && [[ "$_python3_path" != *'/WindowsApps/python3' ]]; then
+  OPENCLAW_PYTHON3_CMD=("$_python3_path")
+fi
+
+if [[ ${#OPENCLAW_PYTHON3_CMD[@]} -eq 0 ]]; then
+  _py_path="$(type -P py 2>/dev/null || true)"
+  if [[ -n "$_py_path" ]]; then
+    OPENCLAW_PYTHON3_CMD=("$_py_path" -3)
+  fi
+fi
+
+if [[ ${#OPENCLAW_PYTHON3_CMD[@]} -eq 0 ]]; then
+  _python_path="$(type -P python 2>/dev/null || true)"
+  if [[ -n "$_python_path" ]]; then
+    OPENCLAW_PYTHON3_CMD=("$_python_path")
+  fi
+fi
+
+if [[ ${#OPENCLAW_PYTHON3_CMD[@]} -gt 0 ]]; then
+  OPENCLAW_PYTHON3_AVAILABLE=1
+fi
+
+python3() {
+  if [[ "$OPENCLAW_PYTHON3_AVAILABLE" -ne 1 ]]; then
+    echo "Error: no usable Python interpreter found" >&2
+    return 1
+  fi
+  "${OPENCLAW_PYTHON3_CMD[@]}" "$@"
+}
+
 # ── Preflight checks ───────────────────────────────────────────────────────
 require_tools() {
   local missing=()
   for tool in "$@"; do
-    command -v "$tool" &>/dev/null || missing+=("$tool")
+    if [[ "$tool" == "python3" ]]; then
+      [[ "$OPENCLAW_PYTHON3_AVAILABLE" -eq 1 ]] || missing+=("$tool")
+    else
+      command -v "$tool" &>/dev/null || missing+=("$tool")
+    fi
   done
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "Error: missing required tools: ${missing[*]}"
@@ -99,7 +140,7 @@ with open(f, 'w') as out:
 # ── Platform helpers ────────────────────────────────────────────────────────
 # Current time in epoch seconds
 epoch_now() {
-  python3 -c "import time; print(int(time.time()))" 2>/dev/null
+  date +%s 2>/dev/null || python3 -c "import time; print(int(time.time()))" 2>/dev/null
 }
 
 # Current UTC timestamp in ISO-8601 form
